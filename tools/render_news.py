@@ -1,184 +1,52 @@
-#!/usr/bin/env python3
-"""Draw the Saturday 21 November 2026 front page of THE WORLD TODAY.
+"""Draw the front page of THE WORLD TODAY for 21 November 2026.
 
-Build-time tool for the make.fun bounty news-image-20261121. It paints
-a 1024x1024 newspaper front page -- masthead, black date band, one lead
-story and six more in a two-by-three grid, each with a small hand-drawn
-pictogram -- and writes it to news-21-nov-2026.png next to this tool.
-
-Everything here is pure Python standard library: the pixel buffer, the
-5x7 bitmap letterforms, the pictograms and the PNG writer are all
-implemented in this file, so the script runs on a vanilla interpreter
-with no third-party packages. Output is deterministic: the same input
-always produces the same bytes.
-
-The seven stories are the day's verified headlines, worded as reported.
+Everything here is plain standard-library Python: a small pixel canvas,
+a hand-made 5-by-7 blocky letter set, a few line-and-shape pictograms,
+and a tiny PNG encoder. Running this file produces
+``news-21-nov-2026.png`` next to the entry folder, 1024 by 1024 pixels,
+and running it twice gives byte-identical output.
 """
 
 import math
+import os
 import struct
+import sys
 import zlib
-from pathlib import Path
-
-# ---------------------------------------------------------------- page
-# Page size and the small palette used across the whole front page.
 
 PAGE_W = 1024
 PAGE_H = 1024
+OUT_NAME = "news-21-nov-2026.png"
 
-PAPER = (250, 244, 230)     # newsprint cream
-INK = (18, 18, 18)         # near-black
-CRIMSON = (176, 32, 32)    # kicker red
-SLATE = (88, 84, 74)       # muted grey for the strapline
-SKY = (52, 96, 158)        # blue accents (water, waves, planet)
-GOLD = (198, 148, 38)      # gold accents (star, badge, key)
+PAPER = (250, 243, 229)
+INK = (18, 18, 18)
+CRIMSON = (176, 32, 32)
+NAVY = (36, 80, 148)
+GOLD = (198, 150, 30)
+PALE_BLUE = (214, 228, 244)
+WHITE = (255, 255, 255)
+GREY = (90, 86, 76)
 
-MARGIN = 24            # inner text margin
-COL_GAP = 24           # gap between the two grid columns
-ROW_TOPS = (374, 559, 744)
-GRID_BOTTOM = 929
-
-
-# -------------------------------------------------------------- canvas
-class Sheet:
-    """An RGB pixel buffer with tiny vector/text drawing helpers."""
-
-    def __init__(self, width, height, background):
-        self.width = width
-        self.height = height
-        self.buf = bytearray(background * (width * height))
-
-    def dot(self, x, y, colour):
-        if 0 <= x < self.width and 0 <= y < self.height:
-            i = (y * self.width + x) * 3
-            self.buf[i:i + 3] = bytes(colour)
-
-    def fill(self, x0, y0, x1, y1, colour):
-        """Fill the rectangle [x0, x1) x [y0, y1), clipped to the page."""
-        x0 = max(0, x0)
-        y0 = max(0, y0)
-        x1 = min(self.width, x1)
-        y1 = min(self.height, y1)
-        if x1 <= x0 or y1 <= y0:
-            return
-        row = bytes(colour) * (x1 - x0)
-        for y in range(y0, y1):
-            i = (y * self.width + x0) * 3
-            self.buf[i:i + len(row)] = row
-
-    def hline(self, x0, x1, y, colour, thick=1):
-        self.fill(x0, y, x1, y + thick, colour)
-
-    def vline(self, x, y0, y1, colour, thick=1):
-        self.fill(x, y0, x + thick, y1, colour)
-
-    def frame(self, x0, y0, x1, y1, colour, thick=1):
-        self.hline(x0, x1, y0, colour, thick)
-        self.hline(x0, x1, y1 - thick, colour, thick)
-        self.vline(x0, y0, y1, colour, thick)
-        self.vline(x1 - thick, y0, y1, colour, thick)
-
-    def segment(self, x0, y0, x1, y1, colour, thick=1):
-        """Bresenham line; thickness is a square brush at each step."""
-        dx = abs(x1 - x0)
-        dy = -abs(y1 - y0)
-        sx = 1 if x0 < x1 else -1
-        sy = 1 if y0 < y1 else -1
-        err = dx + dy
-        half = thick // 2
-        while True:
-            self.fill(x0 - half, y0 - half, x0 - half + thick,
-                      y0 - half + thick, colour)
-            if x0 == x1 and y0 == y1:
-                break
-            e2 = 2 * err
-            if e2 >= dy:
-                err += dy
-                x0 += sx
-            if e2 <= dx:
-                err += dx
-                y0 += sy
-
-    def polyline(self, points, colour, thick=1):
-        for a, b in zip(points, points[1:]):
-            self.segment(a[0], a[1], b[0], b[1], colour, thick)
-
-    def ring(self, cx, cy, radius, colour, thick=1):
-        steps = max(24, int(2 * math.pi * radius))
-        for n in range(steps):
-            a = 2 * math.pi * n / steps
-            self.fill(int(cx + radius * math.cos(a)) - thick // 2,
-                      int(cy + radius * math.sin(a)) - thick // 2,
-                      int(cx + radius * math.cos(a)) - thick // 2 + thick,
-                      int(cy + radius * math.sin(a)) - thick // 2 + thick,
-                      colour)
-
-    def disc(self, cx, cy, radius, colour):
-        for dy in range(-radius, radius + 1):
-            dx = int(math.sqrt(radius * radius - dy * dy))
-            self.hline(cx - dx, cx + dx + 1, cy + dy, colour)
-
-    # -- text ------------------------------------------------------
-    def write(self, x, y, text, scale, colour):
-        """Draw one line of text; returns the x just past the last glyph."""
-        cx = x
-        for ch in text:
-            glyph = GLYPHS.get(ch, GLYPHS[" "])
-            for row, bits in enumerate(glyph):
-                for col, bit in enumerate(bits):
-                    if bit == "#":
-                        self.fill(cx + col * scale, y + row * scale,
-                                  cx + (col + 1) * scale,
-                                  y + (row + 1) * scale, colour)
-            cx += CELL_ADV * scale
-        return cx
-
-    def centred(self, y, text, scale, colour):
-        self.write((self.width - text_width(text, scale)) // 2,
-                   y, text, scale, colour)
-
-    def wrapped(self, x, y, text, scale, colour, max_w, leading):
-        """Greedy word wrap; returns the y just below the last line."""
-        words = text.split(" ")
-        lines = []
-        current = ""
-        for word in words:
-            trial = word if not current else current + " " + word
-            if text_width(trial, scale) <= max_w or not current:
-                current = trial
-            else:
-                lines.append(current)
-                current = word
-        if current:
-            lines.append(current)
-        for line in lines:
-            self.write(x, y, line, scale, colour)
-            y += CELL_H * scale + leading
-        return y - leading
-
-
-# ---------------------------------------------------------------- font
-# Each letterform is seven rows of five cells; '#' is ink, '.' is blank.
-# Only capitals, digits and the punctuation used on the page are needed.
-# The table is grouped: capitals first, then digits, then punctuation.
+# ---------------------------------------------------------------------------
+# Letterforms. Each glyph is seven rows of five cells, '#' meaning ink.
+# These shapes were drawn for this page; capitals, digits and the
+# punctuation the headlines actually use.
+# ---------------------------------------------------------------------------
 
 GLYPHS = {
-    # capitals A-M
     "A": (".###.", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
     "B": ("####.", "#...#", "#...#", "####.", "#...#", "#...#", "####."),
     "C": (".####", "#....", "#....", "#....", "#....", "#....", ".####"),
     "D": ("####.", "#...#", "#...#", "#...#", "#...#", "#...#", "####."),
     "E": ("#####", "#....", "#....", "####.", "#....", "#....", "#####"),
     "F": ("#####", "#....", "#....", "####.", "#....", "#....", "#...."),
-    "G": (".####", "#....", "#....", "#.###", "#...#", "#...#", ".###."),
+    "G": (".####", "#....", "#....", "#..##", "#...#", "#...#", ".###."),
     "H": ("#...#", "#...#", "#...#", "#####", "#...#", "#...#", "#...#"),
     "I": ("#####", "..#..", "..#..", "..#..", "..#..", "..#..", "#####"),
     "J": ("..###", "...#.", "...#.", "...#.", "...#.", "#..#.", ".##.."),
     "K": ("#...#", "#..#.", "#.#..", "##...", "#.#..", "#..#.", "#...#"),
     "L": ("#....", "#....", "#....", "#....", "#....", "#....", "#####"),
     "M": ("#...#", "##.##", "#.#.#", "#.#.#", "#...#", "#...#", "#...#"),
-    # capitals N-Z
-    "N": ("#...#", "##..#", "##..#", "#.#.#", "#..##", "#..##", "#...#"),
+    "N": ("#...#", "##..#", "#.#.#", "#..##", "#...#", "#...#", "#...#"),
     "O": (".###.", "#...#", "#...#", "#...#", "#...#", "#...#", ".###."),
     "P": ("####.", "#...#", "#...#", "####.", "#....", "#....", "#...."),
     "Q": (".###.", "#...#", "#...#", "#...#", "#.#.#", "#..#.", ".##.#"),
@@ -191,316 +59,443 @@ GLYPHS = {
     "X": ("#...#", "#...#", ".#.#.", "..#..", ".#.#.", "#...#", "#...#"),
     "Y": ("#...#", "#...#", ".#.#.", "..#..", "..#..", "..#..", "..#.."),
     "Z": ("#####", "....#", "...#.", "..#..", ".#...", "#....", "#####"),
-    # digits
-    "0": (".###.", "#...#", "#..##", "#.#.#", "##..#", "#...#", ".###."),
+    "0": (".###.", "#..##", "#.#.#", "##..#", "#...#", "#...#", ".###."),
     "1": ("..#..", ".##..", "..#..", "..#..", "..#..", "..#..", ".###."),
     "2": (".###.", "#...#", "....#", "...#.", "..#..", ".#...", "#####"),
     "3": ("####.", "....#", "....#", ".###.", "....#", "....#", "####."),
     "4": ("...#.", "..##.", ".#.#.", "#..#.", "#####", "...#.", "...#."),
     "5": ("#####", "#....", "####.", "....#", "....#", "#...#", ".###."),
     "6": (".###.", "#....", "#....", "####.", "#...#", "#...#", ".###."),
-    "7": ("#####", "....#", "...#.", "..#..", "..#..", "..#..", "..#.."),
+    "7": ("#####", "....#", "...#.", "...#.", "..#..", "..#..", "..#.."),
     "8": (".###.", "#...#", "#...#", ".###.", "#...#", "#...#", ".###."),
     "9": (".###.", "#...#", "#...#", ".####", "....#", "....#", ".###."),
-    # space and punctuation
     " ": (".....", ".....", ".....", ".....", ".....", ".....", "....."),
     ".": (".....", ".....", ".....", ".....", ".....", ".....", ".##.."),
-    ",": (".....", ".....", ".....", ".....", ".....", ".##..", ".#..."),
+    ",": (".....", ".....", ".....", ".....", ".##..", ".##..", ".#..."),
     ":": (".....", ".##..", ".##..", ".....", ".##..", ".##..", "....."),
     ";": (".....", ".##..", ".##..", ".....", ".##..", ".##..", ".#..."),
+    "'": ("..#..", "..#..", "..#..", ".....", ".....", ".....", "....."),
+    '"': (".#.#.", ".#.#.", ".#.#.", ".....", ".....", ".....", "....."),
     "-": (".....", ".....", ".....", ".###.", ".....", ".....", "....."),
-    "'": ("..#..", "..#..", ".#...", ".....", ".....", ".....", "....."),
+    "%": ("##..#", "##.#.", "...#.", "..#..", ".#...", "#.##.", "#..##"),
     "(": ("...##", "..#..", ".#...", ".#...", ".#...", "..#..", "...##"),
     ")": ("##...", "..#..", "...#.", "...#.", "...#.", "..#..", "##..."),
-    "%": ("#...#", "#..#.", "...#.", "..#..", ".#...", "#..#.", "#...#"),
     "/": ("....#", "....#", "...#.", "..#..", ".#...", "#....", "#...."),
-    "+": (".....", "..#..", "..#..", ".###.", "..#..", "..#..", "....."),
     "!": ("..#..", "..#..", "..#..", "..#..", "..#..", ".....", "..#.."),
     "?": (".###.", "#...#", "....#", "...#.", "..#..", ".....", "..#.."),
 }
 
-CELL_W = 5          # glyph columns
-CELL_H = 7          # glyph rows
-CELL_ADV = 6        # advance per character at scale 1 (5 + 1 gap)
+CELL_W = 5
+CELL_H = 7
+CELL_GAP = 1  # one blank column between letters, in glyph units
 
 
-def text_width(text, scale):
-    """Pixel width of text at the given scale, without trailing gap."""
+def glyph_width(text, scale):
+    """Width in pixels of *text* drawn at *scale*."""
     if not text:
         return 0
-    return len(text) * CELL_ADV * scale - scale
+    per_char = (CELL_W + CELL_GAP) * scale
+    return len(text) * per_char - CELL_GAP * scale
 
 
-# ------------------------------------------------------------- stories
-# Each entry drives one block on the page: kicker line, headline, deck
-# and the name of the pictogram drawn beside it. The lead entry spans
-# the full width; the other six fill a two-by-three grid in order.
-# All seven were first reported on Saturday 21 November 2026.
-
-STORIES = [
-    {
-        "kicker": "EUROPE - NATO",
-        "headline": "POLAND SEEKS MORE NATO AIR DEFENCES",
-        "deck": "WARSAW ASKS FOR MORE SUPPORT AFTER TWO RUSSIAN "
-                "MISSILES AND A DRONE CAME DOWN; NATO CALLS IT A "
-                "GRAVE VIOLATION.",
-        "art": "shield",
-        "lead": True,
-    },
-    {
-        "kicker": "MARKETS",
-        "headline": "NASDAQ PLUNGES 5.3% AS NVIDIA TUMBLES ON SEC PROBE REPORT",
-        "deck": "S AND P 500 FALLS 3.7% IN SEVENTH STRAIGHT LOSS; "
-                "NVIDIA DOWN ABOUT 14% AFTER REUTERS REPORT.",
-        "art": "chart",
-    },
-    {
-        "kicker": "LATIN AMERICA - CRIME",
-        "headline": "MEXICO CAPTURES 'EL CHAPO ISIDRO' CARTEL BOSS",
-        "deck": "FAUSTO ISIDRO MEZA FLORES, ONE OF THE FBI'S 10 MOST "
-                "WANTED, SEIZED IN GUASAVE, SINALOA.",
-        "art": "badge",
-    },
-    {
-        "kicker": "ASIA-PACIFIC - QUAKE",
-        "headline": "MAGNITUDE 6.8 QUAKE STRIKES OFF TIMOR-LESTE",
-        "deck": "TREMOR 103 KM NORTHEAST OF LOSPALOS AT 09:42 UTC; "
-                "NO TSUNAMI THREAT, LOW RISK OF DAMAGE.",
-        "art": "quake",
-    },
-    {
-        "kicker": "DIPLOMACY - GENEVA",
-        "headline": "UN TALKS AGREE TO DRAFT 'KILLER ROBOT' RULES",
-        "deck": "128 COUNTRIES IN GENEVA AGREE TO WORK TOWARD RULES "
-                "FOR LETHAL AUTONOMOUS WEAPONS BY 2028.",
-        "art": "robot",
-    },
-    {
-        "kicker": "SPACE",
-        "headline": "BEPICOLOMBO REACHES MERCURY ORBIT AFTER EIGHT YEARS",
-        "deck": "EUROPE-JAPAN TWIN ORBITERS ENTER ORBIT 18:24 UTC; "
-                "ONLY THE SECOND MISSION TO ORBIT MERCURY.",
-        "art": "planet",
-    },
-    {
-        "kicker": "HEALTH",
-        "headline": "PILL HAILED AS BREAKTHROUGH FOR PANCREATIC CANCER",
-        "deck": "DARAXONRASIB MADE TUMOURS UNDETECTABLE IN ONE IN 12 "
-                "PATIENTS; NEARLY ALL TUMOURS STOPPED GROWING.",
-        "art": "pill",
-    },
-]
+def wrap_words(text, scale, max_width):
+    """Greedy word wrap; returns a list of lines that fit *max_width*."""
+    lines = []
+    current = ""
+    for word in text.split(" "):
+        trial = word if not current else current + " " + word
+        if glyph_width(trial, scale) <= max_width or not current:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines
 
 
-# ----------------------------------------------------------- pictograms
-# Each draws inside a small box whose top-left corner is (ox, oy).
-# The pictures are deliberately simple line art: a NATO shield, a
-# falling market chart, a police badge, a seismic trace, a robot
-# head, a ringed planet with its orbiter, and a medicine capsule.
+# ---------------------------------------------------------------------------
+# Pixel canvas
+# ---------------------------------------------------------------------------
 
-def art_shield(s, ox, oy):
-    """NATO shield with a four-point star and two jets overhead."""
-    # Shield outline: flat top, curved sides meeting at a point.
-    s.segment(ox + 14, oy + 6, ox + 62, oy + 6, SKY, 3)
-    s.segment(ox + 14, oy + 6, ox + 14, oy + 30, SKY, 3)
-    s.segment(ox + 62, oy + 6, ox + 62, oy + 30, SKY, 3)
-    s.segment(ox + 14, oy + 30, ox + 38, oy + 52, SKY, 3)
-    s.segment(ox + 62, oy + 30, ox + 38, oy + 52, SKY, 3)
-    # Four-point star in the middle of the shield.
-    cx, cy = ox + 38, oy + 26
-    s.segment(cx, cy - 12, cx, cy + 12, GOLD, 3)
-    s.segment(cx - 12, cy, cx + 12, cy, GOLD, 3)
-    s.segment(cx - 8, cy - 8, cx + 8, cy + 8, GOLD, 2)
-    s.segment(cx - 8, cy + 8, cx + 8, cy - 8, GOLD, 2)
-    # Small jets overhead, guarding the shield.
-    s.segment(ox + 78, oy + 8, ox + 96, oy + 8, INK, 2)
-    s.segment(ox + 96, oy + 8, ox + 104, oy + 5, INK, 2)
-    s.segment(ox + 96, oy + 8, ox + 104, oy + 11, INK, 2)
+class Page:
+    def __init__(self, width, height, background):
+        self.width = width
+        self.height = height
+        self.buf = bytearray(bytes(background)) * (width * height)
 
+    def dot(self, x, y, colour):
+        if 0 <= x < self.width and 0 <= y < self.height:
+            at = (y * self.width + x) * 3
+            self.buf[at] = colour[0]
+            self.buf[at + 1] = colour[1]
+            self.buf[at + 2] = colour[2]
 
-def art_chart(s, ox, oy):
-    # Axes first, then the jagged line falling to the lower right.
-    s.vline(ox + 6, oy + 6, oy + 50, INK, 2)
-    s.hline(ox + 6, ox + 112, oy + 50, INK, 2)
-    points = [(ox + 12, oy + 14), (ox + 30, oy + 20), (ox + 46, oy + 18),
-              (ox + 62, oy + 30), (ox + 78, oy + 28), (ox + 94, oy + 40),
-              (ox + 110, oy + 46)]
-    s.polyline(points, CRIMSON, 2)
-    s.segment(ox + 110, oy + 46, ox + 102, oy + 42, CRIMSON, 2)
-    s.segment(ox + 110, oy + 46, ox + 104, oy + 38, CRIMSON, 2)
-    s.disc(ox + 98, oy + 10, 3, GOLD)
+    def block(self, x, y, w, h, colour):
+        x0 = max(x, 0)
+        y0 = max(y, 0)
+        x1 = min(x + w, self.width)
+        y1 = min(y + h, self.height)
+        for yy in range(y0, y1):
+            base = (yy * self.width + x0) * 3
+            for xx in range(x0, x1):
+                at = base + (xx - x0) * 3
+                self.buf[at] = colour[0]
+                self.buf[at + 1] = colour[1]
+                self.buf[at + 2] = colour[2]
 
+    def frame(self, x, y, w, h, colour, thick=1):
+        self.block(x, y, w, thick, colour)
+        self.block(x, y + h - thick, w, thick, colour)
+        self.block(x, y, thick, h, colour)
+        self.block(x + w - thick, y, thick, h, colour)
 
-def art_badge(s, ox, oy):
-    # Five-point star badge with a crimson centre.
-    cx, cy = ox + 30, oy + 28
-    pts = []
-    for n in range(10):
-        r = 22 if n % 2 == 0 else 9
-        a = -math.pi / 2 + n * math.pi / 5
-        pts.append((cx + int(r * math.cos(a)), cy + int(r * math.sin(a))))
-    s.polyline(pts + [pts[0]], GOLD, 3)
-    s.disc(cx, cy, 4, CRIMSON)
-    # Handcuffs: two linked rings at the lower right.
-    s.ring(ox + 72, oy + 36, 9, INK, 2)
-    s.ring(ox + 92, oy + 36, 9, INK, 2)
-    s.segment(ox + 81, oy + 36, ox + 83, oy + 36, INK, 2)
+    def rule(self, x, y, w, colour, thick=1):
+        self.block(x, y, w, thick, colour)
 
+    def stroke(self, x0, y0, x1, y1, colour):
+        """Bresenham line, inclusive of both ends."""
+        dx = abs(x1 - x0)
+        dy = -abs(y1 - y0)
+        sx = 1 if x0 < x1 else -1
+        sy = 1 if y0 < y1 else -1
+        err = dx + dy
+        x, y = x0, y0
+        while True:
+            self.dot(x, y, colour)
+            if x == x1 and y == y1:
+                return
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy
+                x += sx
+            if e2 <= dx:
+                err += dx
+                y += sy
 
-def art_quake(s, ox, oy):
-    # Ground line cracked by the tremor.
-    s.hline(ox + 6, ox + 58, oy + 44, INK, 2)
-    s.segment(ox + 58, oy + 44, ox + 64, oy + 50, INK, 2)
-    s.hline(ox + 64, ox + 112, oy + 50, INK, 2)
-    # Zigzag seismic trace above the ground.
-    points = [(ox + 8, oy + 28), (ox + 22, oy + 28), (ox + 30, oy + 10),
-              (ox + 38, oy + 40), (ox + 46, oy + 16), (ox + 54, oy + 34),
-              (ox + 66, oy + 28), (ox + 80, oy + 28), (ox + 88, oy + 12),
-              (ox + 96, oy + 36), (ox + 108, oy + 28)]
-    s.polyline(points, CRIMSON, 2)
-    # Small island rooftops shaken by the quake.
-    for hx in (ox + 78, ox + 92):
-        s.segment(hx, oy + 44, hx + 5, oy + 38, INK, 2)
-        s.segment(hx + 10, oy + 44, hx + 5, oy + 38, INK, 2)
+    def thick_stroke(self, x0, y0, x1, y1, radius, colour):
+        steps = max(abs(x1 - x0), abs(y1 - y0), 1) + 1
+        for i in range(steps):
+            t = i / (steps - 1) if steps > 1 else 0.0
+            cx = int(round(x0 + (x1 - x0) * t))
+            cy = int(round(y0 + (y1 - y0) * t))
+            self.disc(cx, cy, radius, colour)
 
+    def disc(self, cx, cy, r, colour):
+        for yy in range(cy - r, cy + r + 1):
+            half = int(math.sqrt(max(r * r - (yy - cy) ** 2, 0)))
+            self.block(cx - half, yy, 2 * half + 1, 1, colour)
 
-def art_robot(s, ox, oy):
-    # Antenna with a blinking tip, then the head frame and glowing eyes.
-    s.vline(ox + 38, oy + 4, oy + 14, INK, 2)
-    s.disc(ox + 38, oy + 6, 3, CRIMSON)
-    s.frame(ox + 16, oy + 14, ox + 60, oy + 44, INK, 2)
-    s.fill(ox + 24, oy + 24, ox + 32, oy + 30, CRIMSON)
-    s.fill(ox + 44, oy + 24, ox + 52, oy + 30, CRIMSON)
-    # Grille mouth.
-    for gx in (ox + 26, ox + 34, ox + 42):
-        s.vline(gx, oy + 34, oy + 40, INK, 2)
-    # Ears and a small "no" cross over the head.
-    s.hline(ox + 10, ox + 16, oy + 26, INK, 2)
-    s.hline(ox + 60, ox + 66, oy + 26, INK, 2)
-    s.segment(ox + 76, oy + 10, ox + 92, oy + 26, CRIMSON, 2)
-    s.segment(ox + 92, oy + 10, ox + 76, oy + 26, CRIMSON, 2)
+    def ring(self, cx, cy, r, colour, thick=2):
+        for rr in range(r - thick + 1, r + 1):
+            for angle in range(360):
+                rad = math.radians(angle)
+                self.dot(cx + int(round(rr * math.cos(rad))),
+                         cy + int(round(rr * math.sin(rad))), colour)
 
+    def fill_poly(self, points, colour):
+        """Scanline fill for a simple polygon given as (x, y) vertices."""
+        if len(points) < 3:
+            return
+        ys = [p[1] for p in points]
+        for yy in range(min(ys), max(ys) + 1):
+            cuts = []
+            n = len(points)
+            for i in range(n):
+                x0, y0 = points[i]
+                x1, y1 = points[(i + 1) % n]
+                if (y0 <= yy < y1) or (y1 <= yy < y0):
+                    t = (yy - y0) / (y1 - y0)
+                    cuts.append(int(round(x0 + t * (x1 - x0))))
+            cuts.sort()
+            for j in range(0, len(cuts) - 1, 2):
+                self.block(cuts[j], yy, cuts[j + 1] - cuts[j] + 1, 1, colour)
 
-def art_planet(s, ox, oy):
-    # Ringed planet (Mercury) with its craters.
-    cx, cy = ox + 34, oy + 30
-    s.disc(cx, cy, 18, GOLD)
-    s.disc(cx - 6, cy - 5, 3, INK)
-    s.disc(cx + 5, cy + 6, 2, INK)
-    s.disc(cx + 8, cy - 8, 2, INK)
-    s.segment(ox + 6, oy + 40, ox + 62, oy + 18, SKY, 2)
-    # Tiny orbiter with solar panels trailing behind.
-    s.disc(ox + 88, oy + 14, 3, INK)
-    s.hline(ox + 76, ox + 84, oy + 14, INK, 2)
-    s.hline(ox + 92, ox + 100, oy + 14, INK, 2)
-    s.segment(ox + 88, oy + 14, ox + 80, oy + 26, SKY, 2)
-    s.segment(ox + 88, oy + 14, ox + 96, oy + 26, SKY, 2)
+    def poly_outline(self, points, colour):
+        n = len(points)
+        for i in range(n):
+            x0, y0 = points[i]
+            x1, y1 = points[(i + 1) % n]
+            self.stroke(x0, y0, x1, y1, colour)
 
-
-def art_pill(s, ox, oy):
-    """Medicine capsule lying diagonally, with a gold health cross."""
-    # Capsule lying diagonally, half red half white, ink outline.
-    cx, cy = ox + 44, oy + 26
-    s.segment(cx - 26, cy + 12, cx + 26, cy - 12, INK, 12)
-    s.segment(cx - 26, cy + 12, cx + 26, cy - 12, CRIMSON, 10)
-    s.segment(cx, cy, cx + 26, cy - 12, PAPER, 10)
-    # Small cross of health beside the capsule.
-    s.fill(ox + 92, oy + 14, ox + 100, oy + 34, GOLD)
-    s.fill(ox + 86, oy + 20, ox + 106, oy + 28, GOLD)
+    def spark(self, cx, cy, outer, inner, tips, colour, tilt=-90.0):
+        """A star with *tips* points, filled."""
+        pts = []
+        for i in range(tips * 2):
+            radius = outer if i % 2 == 0 else inner
+            ang = math.radians(tilt + i * 180.0 / tips)
+            pts.append((cx + int(round(radius * math.cos(ang))),
+                        cy + int(round(radius * math.sin(ang)))))
+        self.fill_poly(pts, colour)
 
 
-ART = {
-    "shield": art_shield,
-    "chart": art_chart,
-    "badge": art_badge,
-    "quake": art_quake,
-    "robot": art_robot,
-    "planet": art_planet,
-    "pill": art_pill,
+# ---------------------------------------------------------------------------
+# Text drawing
+# ---------------------------------------------------------------------------
+
+def draw_text(page, x, y, text, scale, colour):
+    cursor = x
+    for ch in text.upper():
+        glyph = GLYPHS.get(ch, GLYPHS[" "])
+        for row in range(CELL_H):
+            for col in range(CELL_W):
+                if glyph[row][col] == "#":
+                    page.block(cursor + col * scale, y + row * scale,
+                               scale, scale, colour)
+        cursor += (CELL_W + CELL_GAP) * scale
+    return cursor
+
+
+def draw_centred(page, cx, y, text, scale, colour):
+    draw_text(page, cx - glyph_width(text, scale) // 2, y, text, scale, colour)
+
+
+def draw_lines(page, x, y, lines, scale, colour, pitch):
+    for i, line in enumerate(lines):
+        draw_text(page, x, y + i * pitch, line, scale, colour)
+
+
+# ---------------------------------------------------------------------------
+# Pictograms. Each one draws inside a small box (bx, by, bw, bh).
+# ---------------------------------------------------------------------------
+
+def pic_shield(page, bx, by, bw, bh):
+    top = by + 6
+    mid = by + int(bh * 0.55)
+    bot = by + bh - 4
+    pts = [(bx + 8, top), (bx + bw - 8, top), (bx + bw - 2, mid),
+           (bx + bw // 2, bot), (bx + 2, mid)]
+    page.fill_poly(pts, PALE_BLUE)
+    page.poly_outline(pts, NAVY)
+    page.spark(bx + bw // 2, by + int(bh * 0.38), 26, 9, 4, GOLD)
+    page.disc(bx + bw // 2, by + int(bh * 0.38), 4, NAVY)
+
+
+def pic_chart(page, bx, by, bw, bh):
+    page.stroke(bx + 4, by + bh - 10, bx + bw - 4, by + bh - 10, INK)
+    page.stroke(bx + 8, by + 6, bx + 8, by + bh - 10, INK)
+    trail = [(bx + 12, by + 16), (bx + 30, by + 26), (bx + 44, by + 22),
+             (bx + 62, by + 38), (bx + 76, by + 34), (bx + 92, by + 52)]
+    for a, b in zip(trail, trail[1:]):
+        page.thick_stroke(a[0], a[1], b[0], b[1], 2, CRIMSON)
+    page.stroke(92 + bx - 0, by + 52, bx + 92, by + 52, CRIMSON)
+    page.stroke(bx + 92, by + 52, bx + 82, by + 46, CRIMSON)
+    page.stroke(bx + 92, by + 52, bx + 82, by + 58, CRIMSON)
+    page.disc(bx + 30, by + 26, 3, GOLD)
+    page.disc(bx + 62, by + 38, 3, GOLD)
+
+
+def pic_badge(page, bx, by, bw, bh):
+    page.spark(bx + 34, by + 34, 30, 13, 5, GOLD)
+    page.spark(bx + 34, by + 34, 22, 10, 5, PALE_BLUE)
+    page.disc(bx + 34, by + 34, 5, CRIMSON)
+    page.ring(bx + 74, by + 56, 11, INK, 2)
+    page.ring(bx + 92, by + 66, 11, INK, 2)
+    page.stroke(bx + 74, by + 56, bx + 92, by + 66, INK)
+
+
+def pic_seismo(page, bx, by, bw, bh):
+    page.stroke(bx + 4, by + 30, bx + bw - 4, by + 30, INK)
+    spikes = [(bx + 6, by + 30), (bx + 22, by + 30), (bx + 30, by + 12),
+              (bx + 38, by + 48), (bx + 46, by + 20), (bx + 54, by + 30),
+              (bx + 70, by + 30), (bx + 76, by + 18), (bx + 82, by + 42),
+              (bx + 88, by + 30), (bx + bw - 4, by + 30)]
+    for a, b in zip(spikes, spikes[1:]):
+        page.thick_stroke(a[0], a[1], b[0], b[1], 1, CRIMSON)
+    page.stroke(bx + 30, by + 58, bx + 44, by + 66, INK)
+    page.stroke(bx + 44, by + 66, bx + 58, by + 58, INK)
+    page.stroke(bx + 58, by + 58, bx + 72, by + 66, INK)
+
+
+def pic_robot(page, bx, by, bw, bh):
+    page.stroke(bx + 44, by + 4, bx + 44, by + 16, INK)
+    page.disc(bx + 44, by + 4, 4, CRIMSON)
+    page.frame(bx + 14, by + 16, 60, 44, INK, 2)
+    page.block(bx + 26, by + 30, 10, 10, NAVY)
+    page.block(bx + 52, by + 30, 10, 10, NAVY)
+    page.stroke(bx + 30, by + 50, bx + 58, by + 50, INK)
+    page.stroke(bx + 84, by + 18, bx + 98, by + 32, CRIMSON)
+    page.stroke(bx + 98, by + 18, bx + 84, by + 32, CRIMSON)
+
+
+def pic_planet(page, bx, by, bw, bh):
+    page.disc(bx + 40, by + 38, 24, GOLD)
+    page.disc(bx + 32, by + 30, 5, INK)
+    page.disc(bx + 48, by + 44, 4, INK)
+    page.disc(bx + 52, by + 28, 3, INK)
+    page.stroke(bx + 8, by + 50, bx + 72, by + 26, NAVY)
+    page.stroke(bx + 8, by + 54, bx + 72, by + 30, NAVY)
+    # A small moon riding just above the ring, upper right.
+    page.disc(bx + 80, by + 12, 5, NAVY)
+    page.spark(bx + 84, by + 18, 12, 5, 4, NAVY)
+
+
+def pic_capsule(page, bx, by, bw, bh):
+    page.thick_stroke(bx + 16, by + 52, bx + 58, by + 22, 11, CRIMSON)
+    page.thick_stroke(bx + 58, by + 22, bx + 66, by + 16, 11, WHITE)
+    page.ring(bx + 16, by + 52, 12, INK, 2)
+    page.ring(bx + 66, by + 16, 12, INK, 2)
+    page.stroke(bx + 30, by + 44, bx + 52, by + 28, WHITE)
+    page.block(bx + 82, by + 22, 8, 26, GOLD)
+    page.block(bx + 73, by + 31, 26, 8, GOLD)
+
+
+PICTOGRAMS = {
+    "shield": pic_shield,
+    "chart": pic_chart,
+    "badge": pic_badge,
+    "seismo": pic_seismo,
+    "robot": pic_robot,
+    "planet": pic_planet,
+    "capsule": pic_capsule,
 }
 
 
-# -------------------------------------------------------------- layout
-def draw_lead(sheet, story):
-    """Full-width lead story: kicker, big headline, deck, shield art."""
-    sheet.write(MARGIN, 220, story["kicker"], 2, CRIMSON)
-    ART[story["art"]](sheet, 848, 222)
-    y = sheet.wrapped(MARGIN, 240, story["headline"], 4, INK, 806, 8)
-    sheet.wrapped(MARGIN, y + 10, story["deck"], 2, INK,
-                  PAGE_W - 2 * MARGIN, 5)
+# ---------------------------------------------------------------------------
+# Stories
+# ---------------------------------------------------------------------------
+
+LEAD = {
+    "kicker": "EUROPE - NATO",
+    "headline": "POLAND SEEKS MORE NATO AIR DEFENCES",
+    "deck": ("WARSAW ASKS FOR MORE SUPPORT AFTER TWO RUSSIAN MISSILES AND A "
+             "DRONE CAME DOWN: NATO CALLS IT A GRAVE VIOLATION."),
+    "pic": "shield",
+}
+
+GRID = [
+    {"kicker": "MARKETS",
+     "headline": "NASDAQ PLUNGES 5.3% AS NVIDIA TUMBLES ON SEC PROBE REPORT",
+     "deck": ("S AND P 500 FALLS 3.7% IN SEVENTH STRAIGHT LOSS: NVIDIA DOWN "
+              "ABOUT 14% AFTER REUTERS REPORT."),
+     "pic": "chart"},
+    {"kicker": "LATIN AMERICA - CRIME",
+     "headline": "MEXICO CAPTURES 'EL CHAPO ISIDRO' CARTEL BOSS",
+     "deck": ("FAUSTO ISIDRO MEZA FLORES, ONE OF THE FBI'S 10 MOST WANTED, "
+              "SEIZED IN GUASAVE, SINALOA."),
+     "pic": "badge"},
+    {"kicker": "ASIA-PACIFIC - QUAKE",
+     "headline": "MAGNITUDE 6.8 QUAKE STRIKES OFF TIMOR-LESTE",
+     "deck": ("TREMOR 103 KM NORTHEAST OF LOSPALOS AT 09:42 UTC: NO TSUNAMI "
+              "THREAT, LOW RISK OF DAMAGE."),
+     "pic": "seismo"},
+    {"kicker": "DIPLOMACY - GENEVA",
+     "headline": "UN TALKS AGREE TO DRAFT 'KILLER ROBOT' RULES",
+     "deck": ("128 COUNTRIES IN GENEVA AGREE TO WORK TOWARD RULES FOR "
+              "LETHAL AUTONOMOUS WEAPONS BY 2028."),
+     "pic": "robot"},
+    {"kicker": "SPACE",
+     "headline": "BEPICOLOMBO REACHES MERCURY ORBIT AFTER EIGHT YEARS",
+     "deck": ("EUROPE-JAPAN TWIN ORBITERS ENTER ORBIT 18:24 UTC: ONLY THE "
+              "SECOND MISSION TO ORBIT MERCURY."),
+     "pic": "planet"},
+    {"kicker": "HEALTH",
+     "headline": "PILL HAILED AS BREAKTHROUGH FOR PANCREATIC CANCER",
+     "deck": ("DARAXONRASIB MADE TUMOURS UNDETECTABLE IN ONE IN 12 PATIENTS: "
+              "NEARLY ALL TUMOURS STOPPED GROWING."),
+     "pic": "capsule"},
+]
 
 
-def draw_cell(sheet, story, x0, y0, width):
-    """One grid cell: kicker, headline, deck, pictogram top right."""
-    sheet.write(x0, y0, story["kicker"], 2, CRIMSON)
-    ART[story["art"]](sheet, x0 + width - 118, y0 - 2)
-    y = sheet.wrapped(x0, y0 + 22, story["headline"], 3, INK,
-                      width - 132, 7)
-    sheet.wrapped(x0, y + 8, story["deck"], 2, INK, width, 5)
+# ---------------------------------------------------------------------------
+# Page assembly
+# ---------------------------------------------------------------------------
 
+def build_front():
+    page = Page(PAGE_W, PAGE_H, PAPER)
+    page.frame(10, 10, PAGE_W - 20, PAGE_H - 20, INK, 2)
+    page.frame(18, 18, PAGE_W - 36, PAGE_H - 36, INK, 1)
 
-def build_page():
-    """Assemble the whole front page and return the finished sheet."""
-    sheet = Sheet(PAGE_W, PAGE_H, PAPER)
-    # Double frame around the page.
-    sheet.frame(14, 14, PAGE_W - 14, PAGE_H - 14, INK, 3)
-    sheet.frame(22, 22, PAGE_W - 22, PAGE_H - 22, INK, 1)
-    # Masthead and rules.
-    sheet.centred(44, "THE WORLD TODAY", 8, INK)
-    sheet.hline(MARGIN, PAGE_W - MARGIN, 114, INK, 2)
-    sheet.hline(MARGIN, PAGE_W - MARGIN, 120, INK, 1)
-    # Black date band and strapline.
-    sheet.fill(MARGIN, 132, PAGE_W - MARGIN, 182, INK)
-    sheet.centred(143, "SATURDAY, 21 NOVEMBER 2026", 4, PAPER)
-    sheet.centred(194, "SEVEN STORIES - ONE DAY - REPORTED AROUND THE WORLD",
-                  2, SLATE)
-    # Lead story, then a rule.
-    draw_lead(sheet, STORIES[0])
-    sheet.hline(MARGIN, PAGE_W - MARGIN, 358, INK, 1)
-    # Two-by-three grid of the remaining stories.
-    col_w = (PAGE_W - 2 * MARGIN - COL_GAP) // 2
-    for row, top in enumerate(ROW_TOPS):
-        for col in range(2):
-            story = STORIES[1 + row * 2 + col]
-            x0 = MARGIN + col * (col_w + COL_GAP)
-            draw_cell(sheet, story, x0, top, col_w)
-        if row < 2:
-            sheet.hline(MARGIN, PAGE_W - MARGIN, top + 176, INK, 1)
-    sheet.vline(MARGIN + col_w + COL_GAP // 2, ROW_TOPS[0], GRID_BOTTOM,
-                INK, 1)
+    # Masthead.
+    draw_centred(page, PAGE_W // 2, 34, "THE WORLD TODAY", 9, INK)
+    page.rule(30, 106, PAGE_W - 60, INK, 2)
+    page.rule(30, 111, PAGE_W - 60, INK, 1)
+
+    # Black date band.
+    page.block(30, 120, PAGE_W - 60, 46, INK)
+    draw_centred(page, PAGE_W // 2, 129, "SATURDAY, 21 NOVEMBER 2026",
+                 4, WHITE)
+
+    # Tagline and rule.
+    draw_centred(page, PAGE_W // 2, 178,
+                 "SEVEN STORIES - ONE DAY - REPORTED AROUND THE WORLD",
+                 2, GREY)
+    page.rule(30, 200, PAGE_W - 60, INK, 1)
+
+    # Lead story, full width, pictogram on the right.
+    lx, lw = 34, PAGE_W - 68
+    draw_text(page, lx, 212, LEAD["kicker"], 2, CRIMSON)
+    head_lines = wrap_words(LEAD["headline"], 4, lw - 150)
+    draw_lines(page, lx, 234, head_lines, 4, INK, 34)
+    # The deck also stops short of the shield on the right, so no line
+    # of small type ever runs underneath the pictogram.
+    deck_lines = wrap_words(LEAD["deck"], 2, lw - 150)
+    draw_lines(page, lx, 308, deck_lines, 2, INK, 18)
+    PICTOGRAMS[LEAD["pic"]](page, 852, 212, 110, 130)
+    page.rule(30, 356, PAGE_W - 60, INK, 1)
+
+    # Six more stories in a two-by-three grid.
+    col_w = 466
+    row_h = 172
+    grid_top = 370
+    for idx, story in enumerate(GRID):
+        row, col = divmod(idx, 2)
+        cx = 34 + col * 490
+        cy = grid_top + row * row_h
+        draw_text(page, cx, cy + 2, story["kicker"], 2, CRIMSON)
+        lines = wrap_words(story["headline"], 3, col_w - 108)
+        draw_lines(page, cx, cy + 24, lines, 3, INK, 27)
+        deck = wrap_words(story["deck"], 2, col_w)
+        draw_lines(page, cx, cy + 108, deck, 2, INK, 18)
+        PICTOGRAMS[story["pic"]](page, cx + col_w - 104, cy + 22, 104, 80)
+
+    # Grid dividers.
+    page.block(512, grid_top, 1, row_h * 3 - 14, INK)
+    for divider_y in (grid_top + row_h - 8, grid_top + 2 * row_h - 8):
+        page.rule(34, divider_y, PAGE_W - 68, INK, 1)
+
     # Footer.
-    sheet.hline(MARGIN, PAGE_W - MARGIN, 946, INK, 1)
-    sheet.centred(962, "ALL STORIES FIRST REPORTED SATURDAY 21 NOVEMBER 2026.",
-                  2, SLATE)
-    return sheet
+    page.rule(30, 928, PAGE_W - 60, INK, 1)
+    draw_centred(page, PAGE_W // 2, 944,
+                 "ALL STORIES FIRST REPORTED SATURDAY 21 NOVEMBER 2026.",
+                 2, GREY)
+    return page
 
 
-# ------------------------------------------------------------ PNG out
-def encode_png(sheet):
-    """Encode the sheet as a PNG: filter 0 rows, zlib level 9."""
+# ---------------------------------------------------------------------------
+# PNG encoding (filter 0, fixed compression: fully deterministic)
+# ---------------------------------------------------------------------------
+
+def _chunk(kind, payload):
+    size = struct.pack(">I", len(payload))
+    crc = struct.pack(">I", zlib.crc32(kind + payload) & 0xFFFFFFFF)
+    return size + kind + payload + crc
+
+
+def encode_png(page):
     raw = bytearray()
-    stride = sheet.width * 3
-    for y in range(sheet.height):
+    for y in range(page.height):
         raw.append(0)
-        raw += sheet.buf[y * stride:(y + 1) * stride]
-
-    def chunk(tag, data):
-        out = struct.pack(">I", len(data)) + tag + data
-        out += struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        return out
-
-    ihdr = struct.pack(">IIBBBBB", sheet.width, sheet.height, 8, 2, 0, 0, 0)
-    return (b"\x89PNG\r\n\x1a\n"
-            + chunk(b"IHDR", ihdr)
-            + chunk(b"IDAT", zlib.compress(bytes(raw), 9))
-            + chunk(b"IEND", b""))
+        start = y * page.width * 3
+        raw += page.buf[start:start + page.width * 3]
+    ihdr = struct.pack(">IIBBBBB", page.width, page.height, 8, 2, 0, 0, 0)
+    blob = b"\x89PNG\r\n\x1a\n"
+    blob += _chunk(b"IHDR", ihdr)
+    blob += _chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+    blob += _chunk(b"IEND", b"")
+    return blob
 
 
-def main():
-    out_path = Path(__file__).resolve().parent.parent / "news-21-nov-2026.png"
-    out_path.write_bytes(encode_png(build_page()))
-    print(f"wrote {out_path} ({out_path.stat().st_size} bytes)")
+def main(argv):
+    out_path = argv[1] if len(argv) > 1 else os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        OUT_NAME)
+    blob = encode_png(build_front())
+    with open(out_path, "wb") as handle:
+        handle.write(blob)
+    print("wrote {} ({} bytes)".format(out_path, len(blob)))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main(sys.argv))
